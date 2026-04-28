@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,9 +18,12 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.proofly.dev"
-	defaultTimeout = 30 * time.Second
-	userAgent      = "ledgermem-go/0.1.0"
+	defaultBaseURL    = "https://api.proofly.dev"
+	defaultTimeout    = 30 * time.Second
+	userAgent         = "ledgermem-go/0.1.0"
+	defaultMaxRetries = 3
+	defaultBaseDelay  = 200 * time.Millisecond
+	defaultMaxDelay   = 5 * time.Second
 )
 
 // Config configures a Client.
@@ -27,6 +32,9 @@ type Config struct {
 	WorkspaceID string
 	BaseURL     string
 	HTTPClient  *http.Client
+	// MaxRetries is the maximum number of retry attempts on 429/5xx responses
+	// and transient network errors. Zero uses the default (3). Negative disables retries.
+	MaxRetries int
 }
 
 // Client is a LedgerMem API client.
@@ -35,6 +43,7 @@ type Client struct {
 	workspaceID string
 	baseURL     string
 	httpClient  *http.Client
+	maxRetries  int
 
 	Memories *MemoriesService
 }
@@ -54,13 +63,27 @@ func NewClient(cfg Config) *Client {
 		cfg.BaseURL = defaultBaseURL
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: defaultTimeout}
+		// Tune transport with reasonable defaults so callers don't accidentally
+		// share a single open connection forever.
+		t := &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		}
+		cfg.HTTPClient = &http.Client{Timeout: defaultTimeout, Transport: t}
+	}
+	retries := defaultMaxRetries
+	if cfg.MaxRetries > 0 {
+		retries = cfg.MaxRetries
+	} else if cfg.MaxRetries < 0 {
+		retries = 0
 	}
 	c := &Client{
 		apiKey:      cfg.APIKey,
 		workspaceID: cfg.WorkspaceID,
 		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
 		httpClient:  cfg.HTTPClient,
+		maxRetries:  retries,
 	}
 	c.Memories = &MemoriesService{client: c}
 	return c
@@ -208,39 +231,101 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 		reader = bytes.NewReader(buf)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, reqURL, reader)
-	if err != nil {
-		return fmt.Errorf("ledgermem: build request: %w", err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", userAgent)
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-	if c.workspaceID != "" {
-		req.Header.Set("x-workspace-id", c.workspaceID)
+	// Buffer the body so we can resend it on retry.
+	var bodyBytes []byte
+	if reader != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(reader)
+		if err != nil {
+			return fmt.Errorf("ledgermem: read body: %w", err)
+		}
 	}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ledgermem: request: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		var attemptReader io.Reader
+		if bodyBytes != nil {
+			attemptReader = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, reqURL, attemptReader)
+		if err != nil {
+			return fmt.Errorf("ledgermem: build request: %w", err)
+		}
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", userAgent)
+		if c.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		}
+		if c.workspaceID != "" {
+			req.Header.Set("x-workspace-id", c.workspaceID)
+		}
 
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
-		return &APIError{StatusCode: resp.StatusCode, Body: string(raw), Message: extractMessage(raw)}
-	}
-	if resp.StatusCode == http.StatusNoContent || out == nil {
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("ledgermem: request: %w", err)
+			if attempt < c.maxRetries && !isContextErr(err) {
+				if waitErr := backoffSleep(ctx, attempt); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return lastErr
+		}
+
+		if resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = &APIError{StatusCode: resp.StatusCode, Body: string(raw), Message: extractMessage(raw)}
+			if attempt < c.maxRetries {
+				if waitErr := backoffSleep(ctx, attempt); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+			return lastErr
+		}
+
+		// Non-retryable from here.
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			raw, _ := io.ReadAll(resp.Body)
+			return &APIError{StatusCode: resp.StatusCode, Body: string(raw), Message: extractMessage(raw)}
+		}
+		if resp.StatusCode == http.StatusNoContent || out == nil {
+			return nil
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return fmt.Errorf("ledgermem: decode response: %w", err)
+		}
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("ledgermem: decode response: %w", err)
+	return lastErr
+}
+
+// backoffSleep waits with exponential backoff plus jitter, but bails out if
+// the caller's context is cancelled.
+func backoffSleep(ctx context.Context, attempt int) error {
+	d := defaultBaseDelay << attempt
+	if d > defaultMaxDelay {
+		d = defaultMaxDelay
 	}
-	return nil
+	// Full jitter: random in [0, d].
+	d = time.Duration(rand.Int63n(int64(d) + 1))
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func extractMessage(raw []byte) string {
