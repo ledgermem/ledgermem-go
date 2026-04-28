@@ -275,17 +275,24 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 			return lastErr
 		}
 
-		if resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+		if (resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600)) && resp.StatusCode != 501 {
 			raw, _ := io.ReadAll(resp.Body)
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			resp.Body.Close()
 			lastErr = &APIError{StatusCode: resp.StatusCode, Body: string(raw), Message: extractMessage(raw)}
 			if attempt < c.maxRetries {
-				if waitErr := backoffSleep(ctx, attempt); waitErr != nil {
+				if waitErr := backoffSleepHinted(ctx, attempt, retryAfter); waitErr != nil {
 					return waitErr
 				}
 				continue
 			}
 			return lastErr
+		}
+		if resp.StatusCode == 501 {
+			// 501 Not Implemented is permanent — fall through to the error path.
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return &APIError{StatusCode: resp.StatusCode, Body: string(raw), Message: extractMessage(raw)}
 		}
 
 		// Non-retryable from here.
@@ -308,12 +315,31 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 // backoffSleep waits with exponential backoff plus jitter, but bails out if
 // the caller's context is cancelled.
 func backoffSleep(ctx context.Context, attempt int) error {
-	d := defaultBaseDelay << attempt
-	if d > defaultMaxDelay {
-		d = defaultMaxDelay
+	return backoffSleepHinted(ctx, attempt, 0)
+}
+
+// backoffSleepHinted prefers a server-provided Retry-After hint over
+// computed backoff when present. The hint is capped at defaultMaxDelay so
+// a hostile server cannot stall the client indefinitely.
+func backoffSleepHinted(ctx context.Context, attempt int, hint time.Duration) error {
+	var d time.Duration
+	if hint > 0 {
+		d = hint
+		if d > defaultMaxDelay {
+			d = defaultMaxDelay
+		}
+	} else {
+		shift := attempt
+		if shift > 20 {
+			shift = 20
+		}
+		d = defaultBaseDelay << shift
+		if d > defaultMaxDelay {
+			d = defaultMaxDelay
+		}
+		// Full jitter: random in [0, d].
+		d = time.Duration(rand.Int63n(int64(d) + 1))
 	}
-	// Full jitter: random in [0, d].
-	d = time.Duration(rand.Int63n(int64(d) + 1))
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -322,6 +348,25 @@ func backoffSleep(ctx context.Context, attempt int) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// parseRetryAfter understands both delta-seconds and HTTP-date forms.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	return 0
 }
 
 func isContextErr(err error) bool {
