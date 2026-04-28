@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -158,7 +159,7 @@ func (s *MemoriesService) Add(ctx context.Context, in AddMemoryInput) (*Memory, 
 // Update partially updates a memory.
 func (s *MemoriesService) Update(ctx context.Context, id string, in UpdateMemoryInput) (*Memory, error) {
 	out := &Memory{}
-	if err := s.client.do(ctx, http.MethodPatch, "/v1/memories/"+id, nil, in, out); err != nil {
+	if err := s.client.do(ctx, http.MethodPatch, "/v1/memories/"+url.PathEscape(id), nil, in, out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -166,7 +167,7 @@ func (s *MemoriesService) Update(ctx context.Context, id string, in UpdateMemory
 
 // Delete removes a memory.
 func (s *MemoriesService) Delete(ctx context.Context, id string) error {
-	return s.client.do(ctx, http.MethodDelete, "/v1/memories/"+id, nil, nil, nil)
+	return s.client.do(ctx, http.MethodDelete, "/v1/memories/"+url.PathEscape(id), nil, nil, nil)
 }
 
 // List returns a page of memories.
@@ -189,13 +190,13 @@ func (s *MemoriesService) List(ctx context.Context, in ListMemoriesInput) (*List
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query map[string]string, body, out interface{}) error {
-	url := c.baseURL + path
+	reqURL := c.baseURL + path
 	if len(query) > 0 {
-		parts := make([]string, 0, len(query))
+		values := make(url.Values, len(query))
 		for k, v := range query {
-			parts = append(parts, k+"="+v)
+			values.Set(k, v)
 		}
-		url += "?" + strings.Join(parts, "&")
+		reqURL += "?" + values.Encode()
 	}
 
 	var reader io.Reader
@@ -207,7 +208,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 		reader = bytes.NewReader(buf)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, reader)
 	if err != nil {
 		return fmt.Errorf("ledgermem: build request: %w", err)
 	}
