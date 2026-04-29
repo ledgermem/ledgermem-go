@@ -1,4 +1,4 @@
-package ledgermem
+package getmnemo
 
 import (
 	"context"

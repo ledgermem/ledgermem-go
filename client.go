@@ -1,5 +1,5 @@
-// Package ledgermem is the official Go SDK for the LedgerMem API.
-package ledgermem
+// Package getmnemo is the official Go SDK for the Mnemo API.
+package getmnemo
 
 import (
 	"bytes"
@@ -18,9 +18,9 @@ import (
 )
 
 const (
-	defaultBaseURL    = "https://api.proofly.dev"
+	defaultBaseURL    = "https://api.getmnemo.xyz"
 	defaultTimeout    = 30 * time.Second
-	userAgent         = "ledgermem-go/0.1.0"
+	userAgent         = "getmnemo-go/0.1.0"
 	defaultMaxRetries = 3
 	defaultBaseDelay  = 200 * time.Millisecond
 	defaultMaxDelay   = 5 * time.Second
@@ -37,7 +37,7 @@ type Config struct {
 	MaxRetries int
 }
 
-// Client is a LedgerMem API client.
+// Client is a Mnemo API client.
 type Client struct {
 	apiKey      string
 	workspaceID string
@@ -51,13 +51,13 @@ type Client struct {
 // NewClient builds a Client from the given config, falling back to env vars.
 func NewClient(cfg Config) *Client {
 	if cfg.APIKey == "" {
-		cfg.APIKey = os.Getenv("LEDGERMEM_API_KEY")
+		cfg.APIKey = os.Getenv("GETMNEMO_API_KEY")
 	}
 	if cfg.WorkspaceID == "" {
-		cfg.WorkspaceID = os.Getenv("LEDGERMEM_WORKSPACE_ID")
+		cfg.WorkspaceID = os.Getenv("GETMNEMO_WORKSPACE_ID")
 	}
 	if cfg.BaseURL == "" {
-		cfg.BaseURL = os.Getenv("LEDGERMEM_API_URL")
+		cfg.BaseURL = os.Getenv("GETMNEMO_API_URL")
 	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = defaultBaseURL
@@ -98,9 +98,9 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	if e.Message != "" {
-		return fmt.Sprintf("ledgermem: %d %s", e.StatusCode, e.Message)
+		return fmt.Sprintf("getmnemo: %d %s", e.StatusCode, e.Message)
 	}
-	return fmt.Sprintf("ledgermem: %d", e.StatusCode)
+	return fmt.Sprintf("getmnemo: %d", e.StatusCode)
 }
 
 // Memory is a single stored memory.
@@ -226,7 +226,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("ledgermem: marshal body: %w", err)
+			return fmt.Errorf("getmnemo: marshal body: %w", err)
 		}
 		reader = bytes.NewReader(buf)
 	}
@@ -237,7 +237,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 		var err error
 		bodyBytes, err = io.ReadAll(reader)
 		if err != nil {
-			return fmt.Errorf("ledgermem: read body: %w", err)
+			return fmt.Errorf("getmnemo: read body: %w", err)
 		}
 	}
 
@@ -249,7 +249,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 		}
 		req, err := http.NewRequestWithContext(ctx, method, reqURL, attemptReader)
 		if err != nil {
-			return fmt.Errorf("ledgermem: build request: %w", err)
+			return fmt.Errorf("getmnemo: build request: %w", err)
 		}
 		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -265,7 +265,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("ledgermem: request: %w", err)
+			lastErr = fmt.Errorf("getmnemo: request: %w", err)
 			if attempt < c.maxRetries && !isContextErr(err) {
 				if waitErr := backoffSleep(ctx, attempt); waitErr != nil {
 					return waitErr
@@ -305,7 +305,7 @@ func (c *Client) do(ctx context.Context, method, path string, query map[string]s
 			return nil
 		}
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return fmt.Errorf("ledgermem: decode response: %w", err)
+			return fmt.Errorf("getmnemo: decode response: %w", err)
 		}
 		return nil
 	}
